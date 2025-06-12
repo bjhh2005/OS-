@@ -37,7 +37,7 @@
 1. **空闲则入：**没有线程在临界区时，任何线程可进入
 2. **忙则等待：**有线程在临界区时，其他线程均**不能**进入临界区
 3. **有限等待：**等待进入临界区的线程不能无限期等待
-4. **让权等待（可选）：**不能进入临界区的线程，应释放 CPU （如转换到阻塞状态）
+4. **让权等待（可选）：**不能进入临界区的线程，应释放 CPU （如转换到阻塞状态），但一般的自旋解决方案都是等待进程时间片用完后被迫让出 CPU.
 
 ### 解决方案
 
@@ -86,6 +86,9 @@ flag [1] = false;
 ```
 
 - 只能为**两个进程**提供解决方案
+  - `flag`数组表示线程想进入临界区
+  - `turn`表示实际进入临界区的进程
+
 - 如果要支持10个进程的话
   - Eisenberg & McGuire 算法
   - Beakery 算法
@@ -684,6 +687,8 @@ int main(int argc, char *argv []){
 
 值只能是0或1，也称为互斥锁
 
+可用于**多线程或多进程**之间，但只能由对它加锁的线程或进程来解锁。
+
 ``` c
 sem_t m;
 sem_init(&m, 0, x); // what should x be?
@@ -742,7 +747,154 @@ int main(int argc, char *argv []){
 
   
 
+```c
+#include <stdio.h>
+#include <pthread.h>
 
+// 计数信号量结构体
+typedef struct {
+    int value;              // 当前资源数量（value>0可用，value≤0表示等待数）
+    pthread_mutex_t mutex;  // 保护value的互斥锁
+    pthread_cond_t cond;    // 条件变量，用于阻塞/唤醒线程
+} CountingSemaphore;
+
+// 初始化信号量
+void sem_init(CountingSemaphore *sem, int initial_value) {
+    sem->value = initial_value;
+    pthread_mutex_init(&sem->mutex, NULL);
+    pthread_cond_init(&sem->cond, NULL);
+}
+
+// P操作（请求资源）
+void sem_wait(CountingSemaphore *sem) {
+    pthread_mutex_lock(&sem->mutex);
+    sem->value--;  // 尝试获取资源
+    if (sem->value < 0) {
+        // 资源不足，阻塞等待
+        pthread_cond_wait(&sem->cond, &sem->mutex);
+    }
+    pthread_mutex_unlock(&sem->mutex);
+}
+
+// V操作（释放资源）
+void sem_post(CountingSemaphore *sem) {
+    pthread_mutex_lock(&sem->mutex);
+    sem->value++;  // 释放资源
+    if (sem->value <= 0) {
+        // 有进程在等待，唤醒一个
+        pthread_cond_signal(&sem->cond);
+    }
+    pthread_mutex_unlock(&sem->mutex);
+}
+
+// 销毁信号量
+void sem_destroy(CountingSemaphore *sem) {
+    pthread_mutex_destroy(&sem->mutex);
+    pthread_cond_destroy(&sem->cond);
+}
+
+// 多线程竞争有限资源
+#define THREAD_NUM 5
+CountingSemaphore sem;
+
+void* thread_func(void* arg) {
+    int id = *(int*)arg;
+    printf("Thread %d: Trying to acquire resource...\n", id);
+    sem_wait(&sem);  // P操作
+    printf("Thread %d: Acquired resource! (Remaining: %d)\n", id, sem.value);
+    sleep(1);  // 模拟临界区操作
+    sem_post(&sem);  // V操作
+    printf("Thread %d: Released resource.\n", id);
+    return NULL;
+}
+
+int main() {
+    sem_init(&sem, 2);  // 初始化信号量，资源数为2
+
+    pthread_t threads[THREAD_NUM];
+    int thread_ids[THREAD_NUM];
+    for (int i = 0; i < THREAD_NUM; i++) {
+        thread_ids[i] = i;
+        pthread_create(&threads[i], NULL, thread_func, &thread_ids[i]);
+    }
+    for (int i = 0; i < THREAD_NUM; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    sem_destroy(&sem);
+    return 0;
+}
+```
+
+`pthread_cond_wait` 的执行分为三个**原子操作**：
+
+1. **释放互斥锁**：允许其他线程修改共享数据。
+2. **阻塞线程**：将当前线程挂起，直到条件变量`cond`被触发通过`pthread_cond_signal`或`pthread_cond_broadcast`。
+3. **重新加锁**：线程被唤醒后，**自动重新获取互斥锁**，确保后续操作在临界区内执行
+
+> - **问题场景**：
+>   若线程在检查条件（如`sem->value < 0`）后直接挂起（不释放锁），其他线程无法修改共享数据导致条件永远无法满足，所有线程死锁。
+> - **解决方案**：
+>   `pthread_cond_wait` ​**原子性地释放锁并挂起线程**，确保其他线程能获取锁并修改条件（如调用 `sem_post` 增加 `value`），从而唤醒等待的线程
+
+`pthread_join(threads[i], NULL)` 是 POSIX 线程库中用于等待指定线程结束并回收其资源的函数调用。
+
+- **阻塞等待**：当前线程（通常是主线程）会阻塞，直到目标线程`threads[i]`执行完毕。
+
+- **资源回收**：确保目标线程的资源（如栈空间、线程描述符等）被系统回收，避免内存泄漏。
+
+- **返回值忽略**：若传递 `NULL`，表示不接收线程的返回值；若需获取返回值，需传递 `void**` 类型指针的地址
+
+  ```c
+  void *retval;
+  pthread_join(threads[i], &retval);  // 接收返回值
+  ```
+
+  这里的`retval`可以这样理解
+
+  ```c
+  void* thread_func(void* arg) {
+      int* result = malloc(sizeof(int));
+      *result = 100;
+      pthread_exit(result);  // 返回堆内存
+  }
+  
+  int main() {
+      pthread_t tid;
+      void* retval;
+  
+      pthread_create(&tid, NULL, thread_func, NULL);
+      pthread_join(tid, &retval);  // 阻塞等待并获取返回值
+  
+      int* thread_result = (int*)retval;
+      printf("Thread returned: %d\n", *thread_result);
+      free(thread_result);  // 释放内存
+  
+      return 0;
+  }
+  // 输出 Thread returned: 100
+  ```
+
+后面我们将看到几个同步与互斥的例子，但其实他们的思路是一样的。
+
+1. 梳理一共有几个进程，分别是怎么样的执行过程，他们的约束关系是怎么样的（他的执行需要等待谁，他执行之后需要通知谁）
+
+2. 按照每个进程的执行流程，直接写出其伪代码（记得补充足够的注释）
+
+3. 如果需要无条件不断循环进行，记得补充`while(1)`.
+
+4. 有时候需要补充一些非信号量的变量，来便于信号量的设置。而如果有多个进程都需要访问并修改一个变量值，记得用`mutex`进行保护。
+
+5. 注意同步信号量在互斥信号量外面。
+
+6. 回查所有`PV`操作的是否是成对的。
+
+7. 梳理需要的信号量，补充在最前面，并思考其初始值。互斥信号量初始值恒为1，同步信号量需要单独设计。
+
+   - 有的是初始化为资源的个数
+   - 对于强同步关系（叫号问题），就需要初始化为0
+
+   
 
 ### 生产者和消费者问题
 
@@ -793,12 +945,7 @@ void *consumer(void * arg){
     }
 }
 
-int main(int argc, char *argv []){
-    // ...
-    sem_init(&empty, 0, MAX); // MAX are empty
-    sem_init(&full, 0, 0); // 0 are full
-    // ...
-}
+
 ```
 
 尽管通过信号量 `empty` 和 `full` 控制了缓冲区的槽位数量，但 **对共享变量 `fill` 和 `use` 的修改缺乏互斥保护**
@@ -829,12 +976,10 @@ void *consumer(void * arg){
 }
 ```
 
-> 　　`mutex`必须要被包在里面，这样才能避免死锁
->
-> 　若交换顺序
+> `mutex`必须要被包在里面，这样才能避免死锁，若交换顺序
 >
 > 　- 若缓冲区已满（`empty=0`），生产者会阻塞在 `sem_wait(&empty)`。
-> 　- 但生产者仍持有互斥锁，消费者无法进入临界区消费数据并释放空位。
+>　- 但生产者仍持有互斥锁，消费者无法进入临界区消费数据并释放空位。
 > 　- **结果**：所有线程永久阻塞。
 
 
@@ -1110,7 +1255,7 @@ barber() {
         p(customers);   // 等待顾客（若 customers=0，阻塞）
         p(mutex);       // 进入临界区，保护 count
         count = count - 1;  // 减少等待顾客数
-        v(barbers);     // 通知顾客理发师可用
+        v(barbers);     // 通知顾客理发师可用，
         v(mutex);       // 退出临界区
         // 理发（临界区外，允许并发服务）
     }
@@ -1195,7 +1340,7 @@ customer() {
 
 #### 共享内存机制
 
-共享内存（ Shared Memory 是一种最快捷的进程间通信方法，它允许多个进程访问同一块物理内存空间。这种通信方式非常高效，因为数据不需要在进程之间复制。
+共享内存（ Shared Memory ）是一种最快捷的进程间通信方法，它允许多个进程访问同一块物理内存空间。这种通信方式非常高效，因为数据不需要在进程之间复制。
 
 基本原理：
 
@@ -1325,6 +1470,7 @@ struct msgbuf{
 
 - 管道 **不会使用存储设备**，而是使用 **内存** 作为 **数据的缓冲区**。
 - 主要用于父子进程间或者兄弟进程间的通信。它允许一个进程向另一个进程传递数据。
+- 两个进程之间的关系是**互斥和同步关系**，共享区域一定是互斥访问的，但读进程必须等待写进程写后才能读取。
 - 管道有两种类型：**无名管道 pipe** 和 **有名管道（ named pipe 也叫 FIFO ）**
   - **无名（匿名）管道** 主要用于 **父子进程间** 的通信，其基本原理是：在创建管道时，系统 **返回两个文件描述符**，分别代表 **管道的读端和写端**。**父进程** 可以通过 **写端** 向管道中写入数据，**子进程** 则可以通过 **读端** 从管道中读取数据。
   - **有名（命名）管道**（ FIFO 则可以用于 **任何两个进程间** 的通信。它是一种特殊的文件，可以像普通文件一样用 `open` 、 `read` 、 `write` 等系统调用进行操作。一个进程向 FIFO 中写入的数据可以被另一个进程读取出来。
